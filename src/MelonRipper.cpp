@@ -1,173 +1,185 @@
+#include <chrono>
 #include <time.h>
 #include <stdio.h>
-#include <string>
-#include <vector>
+#include <string.h>
 #include "types.h"
-#include "GPU.h"
+#include "GPU3D.h"
+#include "NDS.h"
 #include "MelonRipper.h"
-#include "NDSCart.h"
 
-namespace MelonRipper {
-
-bool IsDumping;
-
-// Request for a (sequence of) rips.
-struct Request {
-    unsigned num_frames_requested;
-    unsigned num_frames_done;
-    unsigned next_frame_number;
-    std::string filename_base;
-
-    void Start(unsigned frames) {
-        num_frames_requested = frames;
-        num_frames_done = 0;
-        next_frame_number = 0;
-    }
-
-    void Done() {
-        num_frames_requested = 0;
-    }
-
-    bool IsDone() const {
-        return num_frames_done >= num_frames_requested;
-    }
-};
-
-// 3D screenshot. Records GPU commands, VRAM data, etc into a buffer.
-struct Rip {
-    std::vector<u8> data;
-    std::string filename;
-
-    void Start() {
-        const char magic[24] = "melon ripper v2";
-        data.reserve(2*1024*1024);
-        data.clear();
-        data.insert(data.begin(), &magic[0], &magic[sizeof(magic)]);
-    }
-
-    void Done() {
-        data.clear();
-    }
-
-    operator bool() const {
-        return !data.empty();
-    }
-
-    void WriteOpcode(const char* s) {
-        data.insert(data.end(), s, s+4);
-    }
-
-    void WriteU16(u16 x) {
-        data.push_back(x & 0xFF);
-        data.push_back(x >> 8);
-    }
-
-    void WriteU32(u32 x) {
-        data.push_back((x >> 0) & 0xFF);
-        data.push_back((x >> 8) & 0xFF);
-        data.push_back((x >> 16) & 0xFF);
-        data.push_back((x >> 24) & 0xFF);
-    }
-
-    void WritePolygon(GPU3D::Vertex verts[4], int nverts) {
-        WriteOpcode(nverts == 3 ? "TRI " : "QUAD");
-
-        for (int i = 0; i != nverts; ++i) {
-            const GPU3D::Vertex& v = verts[i];
-
-            WriteU32(v.WorldPosition[0]);
-            WriteU32(v.WorldPosition[1]);
-            WriteU32(v.WorldPosition[2]);
-            WriteU32(v.Color[0]);
-            WriteU32(v.Color[1]);
-            WriteU32(v.Color[2]);
-            WriteU16(v.TexCoords[0]);
-            WriteU16(v.TexCoords[1]);
-        }
-    }
-
-    void WriteTexParam(u32 param) {
-        WriteOpcode("TPRM");
-        WriteU32(param);
-    }
-
-    void WriteTexPalette(u32 pal) {
-        WriteOpcode("TPLT");
-        WriteU32(pal);
-    }
-
-    void WritePolygonAttr(u32 attr) {
-        WriteOpcode("PATR");
-        WriteU32(attr);
-    }
-
-    void WriteVRAM() {
-        WriteOpcode("VRAM");
-
-        for (int i = 0; i != 4; ++i)
-            WriteU32(GPU::VRAMMap_Texture[i]);
-        for (int i = 0; i != 8; ++i)
-            WriteU32(GPU::VRAMMap_TexPal[i]);
-
-        auto dump_bank = [&](const u8* bank, size_t size) {
-            data.insert(data.end(), bank, bank + size);
-        };
-        dump_bank(GPU::VRAM_A, sizeof(GPU::VRAM_A));
-        dump_bank(GPU::VRAM_B, sizeof(GPU::VRAM_B));
-        dump_bank(GPU::VRAM_C, sizeof(GPU::VRAM_C));
-        dump_bank(GPU::VRAM_D, sizeof(GPU::VRAM_D));
-        dump_bank(GPU::VRAM_E, sizeof(GPU::VRAM_E));
-        dump_bank(GPU::VRAM_F, sizeof(GPU::VRAM_F));
-        dump_bank(GPU::VRAM_G, sizeof(GPU::VRAM_G));
-    }
-
-    void WriteDispCnt() {
-        WriteOpcode("DISP");
-        WriteU32(GPU3D::RenderDispCnt);
-    }
-
-    void WriteToonTable() {
-        WriteOpcode("TOON");
-        for (int i = 0; i != 32; ++i) {
-            WriteU16(GPU3D::RenderToonTable[i]);
-        }
-    }
-};
-
-static Request CurRequest;
-
-// We need two Rips because of double buffering. The lifecycle goes
-//
-// 1. Wait for the game to flush the current frame it's working on.
-// 2. Begin recording commands into CurRip.
-// 3. The next time the game flushes, move CurRip into PendingRip. We
-//    begin recording the second rip into CurRip now.
-// 4. The next time the GPU renders a frame it, finalize PendingRip by
-//    attaching the state of VRAM, etc. and write it out. We need to
-//    wait until it renders because VRAM may change between when the
-//    frame was flushed and when it gets rendered.
-static Rip CurRip, PendingRip;
-
-void Polygon(GPU3D::Vertex verts[4], int nverts)
+namespace melonDS
 {
-    CurRip.WritePolygon(verts, nverts);
-}
+using VecU8 = std::vector<u8>;
 
-void TexParam(u32 param)
+static void WriteMagic(VecU8& rip)
 {
-    CurRip.WriteTexParam(param);
+    const char magic[24] = "melon ripper v2";
+    rip.insert(rip.begin(), &magic[0], &magic[sizeof(magic)]);
 }
 
-void TexPalette(u32 pal) {
-    CurRip.WriteTexPalette(pal);
-}
-
-void PolygonAttr(u32 attr)
+static void WriteOpcode(VecU8& rip, const char* op)
 {
-    CurRip.WritePolygonAttr(attr);
+    rip.insert(rip.end(), op, op + 4);
 }
 
-char ConvertToFilenameChar(char c)
+static void WriteU16(VecU8& rip, u16 x)
+{
+    rip.push_back(x & 0xFF);
+    rip.push_back(x >> 8);
+}
+
+static void WriteU32(VecU8& rip, u32 x)
+{
+    rip.push_back((x >> 0) & 0xFF);
+    rip.push_back((x >> 8) & 0xFF);
+    rip.push_back((x >> 16) & 0xFF);
+    rip.push_back((x >> 24) & 0xFF);
+}
+
+static void WritePolygon(VecU8& rip, Vertex verts[4], int nverts)
+{
+    WriteOpcode(rip, nverts == 3 ? "TRI " : "QUAD");
+
+    for (int i = 0; i != nverts; ++i)
+    {
+        const Vertex& v = verts[i];
+        WriteU32(rip, v.WorldPosition[0]);
+        WriteU32(rip, v.WorldPosition[1]);
+        WriteU32(rip, v.WorldPosition[2]);
+        WriteU32(rip, v.Color[0]);
+        WriteU32(rip, v.Color[1]);
+        WriteU32(rip, v.Color[2]);
+        WriteU16(rip, v.TexCoords[0]);
+        WriteU16(rip, v.TexCoords[1]);
+    }
+}
+
+static void WriteTexParam(VecU8& rip, u32 tex_param)
+{
+    WriteOpcode(rip, "TPRM");
+    WriteU32(rip, tex_param);
+}
+
+static void WriteTexPalette(VecU8& rip, u32 tex_pal)
+{
+    WriteOpcode(rip, "TPLT");
+    WriteU32(rip, tex_pal);
+}
+
+static void WritePolygonAttr(VecU8& rip, u32 attr)
+{
+    WriteOpcode(rip, "PATR");
+    WriteU32(rip, attr);
+}
+
+static void WriteVRAM(VecU8& rip, const melonDS::GPU& GPU)
+{
+    WriteOpcode(rip, "VRAM");
+
+    for (int i = 0; i != 4; ++i)
+        WriteU32(rip, GPU.VRAMMap_Texture[i]);
+
+    for (int i = 0; i != 8; ++i)
+        WriteU32(rip, GPU.VRAMMap_TexPal[i]);
+
+    auto DumpBank = [&](const u8* bank, size_t nkb) {
+        rip.insert(rip.end(), bank, bank + nkb * 1024);
+    };
+    DumpBank(GPU.VRAM_A, 128);
+    DumpBank(GPU.VRAM_B, 128);
+    DumpBank(GPU.VRAM_C, 128);
+    DumpBank(GPU.VRAM_D, 128);
+    DumpBank(GPU.VRAM_E, 64);
+    DumpBank(GPU.VRAM_F, 16);
+    DumpBank(GPU.VRAM_G, 16);
+}
+
+static void WriteDispCnt(VecU8& rip, u32 disp_cnt)
+{
+    WriteOpcode(rip, "DISP");
+    WriteU32(rip, disp_cnt);
+}
+
+static void WriteToonTable(VecU8& rip, u16 toon_table[32])
+{
+    WriteOpcode(rip, "TOON");
+    for (int i = 0; i != 32; ++i)
+        WriteU16(rip, toon_table[i]);
+}
+
+void MelonRipper::Reset() noexcept
+{
+    RequestCount = 0;
+    DumpPolys = false;
+    BackRip.clear();
+    FrontRip.clear();
+}
+
+void MelonRipper::Polygon(Vertex verts[4], int nverts)
+{
+    WritePolygon(BackRip, verts, nverts);
+}
+
+void MelonRipper::TexParam(u32 tex_param)
+{
+    WriteTexParam(BackRip, tex_param);
+}
+
+void MelonRipper::TexPalette(u32 tex_pal)
+{
+    WriteTexPalette(BackRip, tex_pal);
+}
+
+void MelonRipper::PolygonAttr(u32 attr)
+{
+    WritePolygonAttr(BackRip, attr);
+}
+
+void MelonRipper::NotifyFlush()
+{
+    if (DumpPolys)
+    {
+        // Move BackRip to FrontRip and consider one request
+        // finished.
+        std::swap(BackRip, FrontRip);
+        BackRip.clear();
+        RequestCount--;
+    }
+
+    DumpPolys = false;
+
+    if (RequestCount > 0)
+    {
+        InitBackRip();
+        DumpPolys = true;
+    }
+}
+
+void MelonRipper::NotifyRender()
+{
+    if (!FrontRip.empty())
+    {
+        FinishFrontRip();
+        SaveFrontRipToFile();
+        FrontRip.clear();
+    }
+}
+
+void MelonRipper::InitBackRip()
+{
+    BackRip.clear();
+    BackRip.reserve(1 * 1024 * 1024);  // 1 MB
+    WriteMagic(BackRip);
+}
+
+void MelonRipper::FinishFrontRip()
+{
+    WriteVRAM(FrontRip, NDS.GPU);
+    WriteDispCnt(FrontRip, NDS.GPU.GPU3D.RenderDispCnt);
+    WriteToonTable(FrontRip, NDS.GPU.GPU3D.RenderToonTable);
+}
+
+static char ConvertToFilenameChar(char c)
 {
     if (('0' <= c && c <= '9') || ('a' <= c && c <= 'z'))
         return c;
@@ -176,133 +188,74 @@ char ConvertToFilenameChar(char c)
     return 0;
 }
 
-void InitRequestFilename()
+static void GetGameTitleForFilename(char title[13], const melonDS::NDS& NDS)
 {
-    std::string& s = CurRequest.filename_base;
-    s.clear();
+    title[0] = 0;
 
-    // <GameTitle>
-    for (int i = 0; i != 12; ++i) {
-        char c = NDSCart::Header.GameTitle[i];
-        c = ConvertToFilenameChar(c);
-        if (c) s.push_back(c);
+    const auto cart = NDS.NDSCartSlot.GetCart();
+    if (cart)
+    {
+        const auto& hdr = cart->GetHeader();
+        int j = 0;
+        for (int i = 0; i != 12; i++)
+        {
+            char c = hdr.GameTitle[i];
+            c = ConvertToFilenameChar(c);
+            if (c) title[j++] = c;
+        }
+        title[j] = 0;
     }
 
-    // Fallback if empty for some reason
-    if (s.empty())
-        s = "melonrip";
+    // Default name if empty for some reason
+    if (title[0] == 0)
+        strcpy(title, "melonrip");
+}
 
-    // -YYYY-MM-DD-HH-MM-SS
+static void GetTimeWithMilliseconds(time_t& t, int& millis)
+{
+    namespace chrono = std::chrono;
+
+    auto now = chrono::system_clock::now();
+    t = chrono::system_clock::to_time_t(now);
+
+    auto d = now.time_since_epoch();
+    auto secs = chrono::duration_cast<chrono::seconds>(d);
+    millis = chrono::duration_cast<chrono::milliseconds>(d - secs).count();
+}
+
+static void GetDumpFileName(char* filename, size_t len, const melonDS::NDS& NDS)
+{
     time_t t;
-    struct tm *tmp;
-    t = time(nullptr);
-    tmp = localtime(&t);
-    char buf[32];
-    strftime(buf, sizeof(buf), "-%Y-%m-%d-%H-%M-%S", tmp);
-    s += buf;
+    int millis;
+    GetTimeWithMilliseconds(t, millis);
+
+    char datetime[32];
+    struct tm *tm = localtime(&t);
+    strftime(datetime, sizeof(datetime), "%Y-%m-%d-%H-%M-%S", tm);
+
+    char title[13];
+    GetGameTitleForFilename(title, NDS);
+
+    snprintf(filename, len, "%s-%s-%03d.dump", title, datetime, millis);
 }
 
-void InitRipFilename()
+void MelonRipper::SaveFrontRipToFile() const
 {
-    CurRip.filename = CurRequest.filename_base;
-
-    // Append _f{frame number} if ripping multiple frames
-    if (CurRequest.num_frames_requested > 1) {
-        CurRip.filename += "_f";
-        CurRip.filename += std::to_string(CurRequest.next_frame_number);
-    }
-
-    CurRip.filename += ".dump";
-}
-
-void BeginRip()
-{
-    CurRip.Start();
-    InitRipFilename();
-    CurRequest.next_frame_number++;
-}
-
-void MoveCurRipToPending()
-{
-    if (!CurRip)
-        return;
-
-    if (PendingRip)
-        return;
-
-    std::swap(PendingRip, CurRip);
-}
-
-void WritePendingRip()
-{
-    const char* filename = PendingRip.filename.c_str();
+    char filename[64];
+    GetDumpFileName(filename, sizeof(filename), NDS);
 
     bool ok = false;
     FILE* fp = fopen(filename, "wb+");
-    if (fp) {
-        ok = fwrite(PendingRip.data.data(), PendingRip.data.size(), 1, fp) == 1;
+    if (fp)
+    {
+        if (fwrite(FrontRip.data(), FrontRip.size(), 1, fp) == 1)
+            ok = true;
         fclose(fp);
     }
 
     if (ok)
-        printf("MelonRipper: ripped frame to %s\n", filename);
+        printf("MelonRipper: ripped %s\n", filename);
     else
         printf("MelonRipper: error writing %s\n", filename);
 }
-
-void FinishPendingRip()
-{
-    // Write the last of the data
-    PendingRip.WriteVRAM();
-    PendingRip.WriteDispCnt();
-    PendingRip.WriteToonTable();
-
-    WritePendingRip();
-    PendingRip.Done();
-    CurRequest.num_frames_done++;
-}
-
-void RequestRip(unsigned num_frames)
-{
-    if (!CurRequest.IsDone())
-        return;
-
-    CurRequest.Start(num_frames);
-    InitRequestFilename();
-}
-
-void NotifyFlushRequest()
-{
-    IsDumping = false;
-
-    if (CurRequest.IsDone())
-        return;
-
-    MoveCurRipToPending();
-
-    if (CurRip) {
-        // In case PendingRip still exists which blocked the CurRequest
-        // from being moved. This can only happen if there are two flush
-        // requests with no render frame in between, which shouldn't
-        // happen.
-        return;
-    }
-
-    if (CurRequest.next_frame_number >= CurRequest.num_frames_requested) {
-        // The last rip of the request is pending, but not finished yet.
-        // We don't need to start a new one. This also shouldn't happen,
-        // for the same reason.
-        return;
-    }
-
-    BeginRip();
-    IsDumping = true;
-}
-
-void NotifyRenderFrame()
-{
-    if (PendingRip)
-        FinishPendingRip();
-}
-
 }
